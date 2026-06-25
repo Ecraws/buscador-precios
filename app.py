@@ -12,9 +12,14 @@ def cargar_datos():
     try:
         df = pd.read_excel("productos.xlsx")
         
-        # Convertimos a texto para evitar errores en las búsquedas
+        # Convertimos todas las columnas de búsqueda a texto limpio y minúsculas
         df['desc_busqueda'] = df['Descripcion'].astype(str).str.lower()
         df['scan_busqueda'] = df['codigoscanner'].astype(str).str.strip()
+        
+        # Limpiamos el Código Interno para la búsqueda (quitando decimales si se generaron de más)
+        df['interno_busqueda'] = df['Codigo Interno'].astype(str).apply(
+            lambda x: x.split('.')[0] if '.' in x and x.split('.')[1] == '0' else x
+        ).str.strip().str.lower()
         
         return df
     except Exception as e:
@@ -24,14 +29,15 @@ def cargar_datos():
 df = cargar_datos()
 
 if df is not None:
-    # Barra de búsqueda única (sirve para la descripción o el código de barras)
-    busqueda = st.text_input("🔍 Buscar por Descripción o Código Scanner:", "").strip().lower()
+    # Barra de búsqueda única (sirve para Descripción, Scanner o Código Interno)
+    busqueda = st.text_input("🔍 Buscar por Descripción, Scanner o Cód. Interno:", "").strip().lower()
 
     if busqueda:
-        # Filtra si coincide con la descripción o con el código de barras
+        # Filtra si coincide con cualquiera de las 3 columnas
         resultados = df[
             df['desc_busqueda'].str.contains(busqueda, na=False) | 
-            df['scan_busqueda'].str.contains(busqueda, na=False)
+            df['scan_busqueda'].str.contains(busqueda, na=False) |
+            df['interno_busqueda'].str.contains(busqueda, na=False)
         ]
         
         if not resultados.empty:
@@ -50,17 +56,17 @@ if df is not None:
                     col1, col2 = st.columns(2)
                     with col1:
                         if pd.notna(fila['Codigo Interno']):
-                            # Pequeño truco para que los códigos numéricos enteros no se muestren con decimales (.0)
-                            cod_int = fila['Codigo Interno']
-                            st.markdown(f"🔢 **Cód. Interno:** {int(cod_int) if isinstance(cod_int, float) and cod_int.is_integer() else cod_int}")
+                            # Muestra el código interno limpio sin decimales molestos (.0)
+                            cod_int_texto = str(fila['Codigo Interno']).split('.')[0] if '.' in str(fila['Codigo Interno']) and str(fila['Codigo Interno']).split('.')[1] == '0' else str(fila['Codigo Interno'])
+                            st.markdown(f"🔢 **Cód. Interno:** {cod_int_texto}")
                         if pd.notna(fila['Descrip Sector']):
                             st.markdown(f"📁 **Sector:** {fila['Descrip Sector']}")
                     with col2:
                         if pd.notna(fila['codigoscanner']):
-                            # Evita que códigos de barra largos se muestren en formato científico (ej: 7.79e+12) o con decimales
+                            # Evita que códigos de barra largos se muestren en formato científico o con decimales
                             scanner_texto = str(fila['codigoscanner']).split('.')[0] if '.' in str(fila['codigoscanner']) else str(fila['codigoscanner'])
                             st.markdown(f"🏷️ **Scanner:** {scanner_texto}")
                             
                     st.write("---")
         else:
-            st.warning("No se encontraron productos con esa descripción o código.")
+            st.warning("No se encontraron productos con esos datos.")
