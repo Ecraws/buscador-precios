@@ -77,7 +77,7 @@ def procesar_archivo_inteligente(file_buffer, nombre_archivo):
         else:
             df = pd.read_excel(file_buffer)
         
-        # 2. Si 'Codigo Interno' no está en el encabezado, buscar salteando filas
+        # 2. Buscar si 'Codigo Interno' está salteando filas
         cols_limpias = [str(c).strip() for c in df.columns]
         if 'Codigo Interno' not in cols_limpias:
             for skip in range(1, 10):
@@ -153,9 +153,9 @@ with tab1:
         
         if busqueda:
             b_lower = busqueda.lower()
-            cond_cod = df_precios['Codigo Interno'].str.lower() == b_lower
-            cond_scan = df_precios['codigoscanner'].str.lower() == b_lower if 'codigoscanner' in df_precios.columns else False
-            cond_desc = df_precios['Descripcion'].str.lower().str.contains(b_lower, regex=False) if 'Descripcion' in df_precios.columns else False
+            cond_cod = df_precios['Codigo Interno'].str.lower() == b_lower if 'Codigo Interno' in df_precios.columns else pd.Series(False, index=df_precios.index)
+            cond_scan = df_precios['codigoscanner'].str.lower() == b_lower if 'codigoscanner' in df_precios.columns else pd.Series(False, index=df_precios.index)
+            cond_desc = df_precios['Descripcion'].str.lower().str.contains(b_lower, regex=False) if 'Descripcion' in df_precios.columns else pd.Series(False, index=df_precios.index)
             
             res = df_precios[cond_cod | cond_scan | cond_desc]
             
@@ -186,9 +186,9 @@ with tab2:
         
         if busqueda_of:
             b_lower = busqueda_of.lower()
-            cond_cod = df_ofertas['Codigo Interno'].str.lower() == b_lower
-            cond_scan = df_ofertas['codigoscanner'].str.lower() == b_lower if 'codigoscanner' in df_ofertas.columns else False
-            cond_desc = df_ofertas['Descripcion'].str.lower().str.contains(b_lower, regex=False) if 'Descripcion' in df_ofertas.columns else False
+            cond_cod = df_ofertas['Codigo Interno'].str.lower() == b_lower if 'Codigo Interno' in df_ofertas.columns else pd.Series(False, index=df_ofertas.index)
+            cond_scan = df_ofertas['codigoscanner'].str.lower() == b_lower if 'codigoscanner' in df_ofertas.columns else pd.Series(False, index=df_ofertas.index)
+            cond_desc = df_ofertas['Descripcion'].str.lower().str.contains(b_lower, regex=False) if 'Descripcion' in df_ofertas.columns else pd.Series(False, index=df_ofertas.index)
             
             res_of = df_ofertas[cond_cod | cond_scan | cond_desc]
             
@@ -205,9 +205,15 @@ with tab2:
             else:
                 st.warning("No se encontraron ofertas con esa búsqueda.")
         else:
-            # Mostrar lista completa de ofertas si no busca nada
+            # Mostrar lista completa de ofertas filtrando solo las columnas que existan realmentes
+            cols_deseadas = ['Codigo Interno', 'Descripcion', 'Precio']
+            cols_existentes = [col for col in cols_deseadas if col in df_ofertas.columns]
+            
             st.markdown("### Lista completa de ofertas disponibles:")
-            st.dataframe(df_ofertas[['Codigo Interno', 'Descripcion', 'Precio']], use_container_width=True)
+            if cols_existentes:
+                st.dataframe(df_ofertas[cols_existentes], use_container_width=True)
+            else:
+                st.dataframe(df_ofertas, use_container_width=True)
     else:
         st.info("No se encontró ningún archivo en la carpeta `ofertas/` de GitHub.")
         
