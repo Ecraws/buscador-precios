@@ -240,15 +240,6 @@ st.markdown("""
 # Título de la App
 st.markdown('<h1 style="text-align: center; font-size: 28px; font-weight: 800; background: linear-gradient(90deg, #ffffff, #94a3b8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 20px;">⚡ ECRAWS PRICE</h1>', unsafe_allow_html=True)
 
-# --- AUXILIAR PARA OBTENER EL ARCHIVO MÁS RECIENTE ---
-def obtener_ultimo_archivo(carpeta, nombre_fallback=""):
-    archivos = glob.glob(os.path.join(carpeta, "*.xlsx")) + glob.glob(os.path.join(carpeta, "*.xls"))
-    if archivos:
-        return max(archivos, key=os.path.getmtime)
-    if nombre_fallback and os.path.exists(nombre_fallback):
-        return nombre_fallback
-    return None
-
 # --- FIRMA DE ARCHIVOS PARA INVALIDAR CACHÉ AUTOMÁTICAMENTE ---
 def obtener_firma_archivos():
     """Devuelve una tupla (ruta, fecha_modificacion) por cada archivo relevante.
@@ -304,14 +295,16 @@ def evaluar_estado_oferta(desde_val, hasta_val):
         if hoy > f_hasta:
             return 'vencido'
             
+        dias_para_terminar = (f_hasta - hoy).days
+
         if hoy == f_hasta:
             return '<span class="status-tiempo status-ultimo">⚠️ ¡ÚLTIMO DÍA! Quitar cartel al cerrar</span>'
             
         diferencia = (hoy - f_desde).days
         if diferencia >= 0:
-            return f'<span class="status-tiempo status-activo">⏱️ Activa (Hace {diferencia} días)</span>'
+            return f'<span class="status-tiempo status-activo">⏱️ Activa (Hace {diferencia} días · Termina en {dias_para_terminar} días)</span>'
         else:
-            return f'<span class="status-tiempo status-futuro">⏳ Inicia en {abs(diferencia)} días</span>'
+            return f'<span class="status-tiempo status-futuro">⏳ Inicia en {abs(diferencia)} días (Termina en {dias_para_terminar} días)</span>'
     except (ValueError, TypeError, AttributeError):
         return ""
 
@@ -373,6 +366,15 @@ def detectar_columna(df, alias_posibles, indice_fallback=None, excluir=None):
         return df.columns[indice_fallback]
     return None
 
+def buscar_hoja(nombres_disponibles, objetivo):
+    """Encuentra el nombre real de una hoja de Excel comparando sin importar
+    mayúsculas/minúsculas ni espacios sobrantes (ej: ' ofertas ' == 'OFERTAS')."""
+    objetivo_low = objetivo.strip().lower()
+    for nombre in nombres_disponibles:
+        if str(nombre).strip().lower() == objetivo_low:
+            return nombre
+    return None
+
 def valor_fila(fila, columna, default=None):
     """Acceso seguro a un valor de fila por nombre de columna."""
     if columna is None or columna not in fila:
@@ -390,112 +392,119 @@ def cargar_todo(firma_archivos):
     mapa_interno_a_barras = {}
     diagnosticos = []
 
-    # 1. Maestro EAN
-    archivo_ean = obtener_ultimo_archivo("precios", "maestro ean.xlsx")
-    if not archivo_ean and os.path.exists("maestro ean.xlsx"):
-        archivo_ean = "maestro ean.xlsx"
-        
-    if archivo_ean:
+    # 1 y 2. Carpeta "precios/": products con precio Y maestro de códigos/EAN.
+    # No importa el nombre de los archivos: se procesan TODOS los que haya en la carpeta,
+    # y cada uno se clasifica según su contenido (si tiene una columna de precio, se trata
+    # como padrón de productos; si no, se asume que es un maestro de códigos/EAN).
+    archivos_precios_candidatos = []
+    if os.path.isdir("precios"):
+        archivos_precios_candidatos = glob.glob(os.path.join("precios", "*.xlsx")) + glob.glob(os.path.join("precios", "*.xls"))
+    for nombre_respaldo in ("productos.xlsx", "maestro ean.xlsx"):
+        if os.path.exists(nombre_respaldo) and nombre_respaldo not in archivos_precios_candidatos:
+            archivos_precios_candidatos.append(nombre_respaldo)
+
+    frames_productos = []
+
+    for ruta in archivos_precios_candidatos:
         try:
-            df_maestro = pd.read_excel(archivo_ean)
-            for fila_idx, fila in df_maestro.iterrows():
-                if fila.dropna().empty: continue
-                try:
-                    cod_interno_objetivo = limpiar_codigo(fila.iloc[0])
-                    if not cod_interno_objetivo: continue
-
-                    barras_c = fragmentar_codigos_multiples(fila.iloc[2]) if len(fila) > 2 else []
-                    barras_d = fragmentar_codigos_multiples(fila.iloc[3]) if len(fila) > 3 else []
-
-                    for cb in (barras_c + barras_d):
-                        if cb:
-                            mapa_puente_barras[cb] = cod_interno_objetivo
-                            lista_barras = mapa_interno_a_barras.setdefault(cod_interno_objetivo, [])
-                            if cb not in lista_barras:
-                                lista_barras.append(cb)
-                except Exception as e:
-                    diagnosticos.append(f"Maestro EAN, fila {fila_idx + 2}: {e}")
+            df_temp = pd.read_excel(ruta)
         except Exception as e:
-            diagnosticos.append(f"No se pudo leer '{archivo_ean}': {e}")
+            diagnosticos.append(f"No se pudo leer '{ruta}': {e}")
+            continue
 
-    # 2. Productos / Precios (Busca en carpeta precios/)
-    archivo_precios = obtener_ultimo_archivo("precios", "productos.xlsx")
-    if not archivo_precios and os.path.exists("productos.xlsx"):
-        archivo_precios = "productos.xlsx"
-        
-    if archivo_precios:
+        if df_temp.dropna(how='all').empty:
+            continue
+
         try:
             # Tolerancia a padrones exportados de sistemas con encabezado en fila 4 o estándar
-            df_temp = pd.read_excel(archivo_precios)
             header_idx = 0
             for idx, row in df_temp.iterrows():
-                row_str = row.astype(str).str.lower().tolist()
+                row_str = [str(v).lower() for v in row.tolist()]
                 if any('codigo' in s or 'código' in s or 'descripcion' in s or 'descripción' in s for s in row_str):
                     header_idx = idx + 1
                     break
-            
-            df_base = pd.read_excel(archivo_precios, skiprows=header_idx) if header_idx > 0 else df_temp
-            
-            # Mapeo flexible de columnas para Padrones de Artículos o productos.xlsx.
-            # IMPORTANTE: se resuelve por PRIORIDAD (no se sobrescribe con la última coincidencia),
-            # y el código interno se distingue explícitamente del EAN/código de barras.
-            col_cod, col_ean, col_desc, col_prec, col_sec = None, None, None, None, None
+            df_archivo = pd.read_excel(ruta, skiprows=header_idx) if header_idx > 0 else df_temp
 
-            # Prioridad 1: nombres explícitos
-            for col in df_base.columns:
-                c_low = str(col).lower()
-                if col_cod is None and 'interno' in c_low:
-                    col_cod = col
-                if col_ean is None and ('ean' in c_low or 'barra' in c_low):
-                    col_ean = col
-                if col_desc is None and 'descrip' in c_low and 'sector' not in c_low and 'rubro' not in c_low:
-                    col_desc = col
-                if col_prec is None and 'precio' in c_low:
-                    col_prec = col
-                if col_sec is None and ('sector' in c_low or 'rubro' in c_low):
-                    col_sec = col
+            columnas_low = [str(c).lower() for c in df_archivo.columns]
+            parece_productos = any('precio' in c for c in columnas_low)
 
-            # Prioridad 2 (respaldo): "código" genérico, solo si no hay "interno" y excluyendo EAN/barra
-            if col_cod is None:
-                for col in df_base.columns:
+            if parece_productos:
+                # Mapeo flexible de columnas. Se resuelve por PRIORIDAD (no se sobrescribe
+                # con la última coincidencia), y el código interno se distingue del EAN/barras.
+                col_cod, col_ean, col_desc, col_prec, col_sec = None, None, None, None, None
+                for col in df_archivo.columns:
                     c_low = str(col).lower()
-                    if ('codigo' in c_low or 'código' in c_low) and 'ean' not in c_low and 'barra' not in c_low:
+                    if col_cod is None and 'interno' in c_low:
                         col_cod = col
-                        break
+                    if col_ean is None and ('ean' in c_low or 'barra' in c_low):
+                        col_ean = col
+                    if col_desc is None and 'descrip' in c_low and 'sector' not in c_low and 'rubro' not in c_low:
+                        col_desc = col
+                    if col_prec is None and 'precio' in c_low:
+                        col_prec = col
+                    if col_sec is None and ('sector' in c_low or 'rubro' in c_low):
+                        col_sec = col
 
-            # Fallback posicional si ninguna búsqueda por nombre funcionó
-            col_cod = col_cod if col_cod is not None else (df_base.columns[0] if len(df_base.columns) > 0 else 'Codigo Interno')
-            col_desc = col_desc if col_desc is not None else (df_base.columns[1] if len(df_base.columns) > 1 else 'Descripcion')
-            col_prec = col_prec if col_prec is not None else (df_base.columns[2] if len(df_base.columns) > 2 else 'Precio')
-            col_sec = col_sec if col_sec is not None else (df_base.columns[3] if len(df_base.columns) > 3 else 'Descrip Sector')
+                if col_cod is None:
+                    for col in df_archivo.columns:
+                        c_low = str(col).lower()
+                        if ('codigo' in c_low or 'código' in c_low) and 'ean' not in c_low and 'barra' not in c_low:
+                            col_cod = col
+                            break
 
-            if col_cod not in df_base.columns or col_desc not in df_base.columns or col_prec not in df_base.columns:
-                diagnosticos.append(
-                    f"'{archivo_precios}': no se detectaron con certeza las columnas de código/descripción/precio. "
-                    f"Se usan las primeras columnas disponibles como respaldo, revisá los encabezados."
-                )
+                col_cod = col_cod if col_cod is not None else (df_archivo.columns[0] if len(df_archivo.columns) > 0 else None)
+                col_desc = col_desc if col_desc is not None else (df_archivo.columns[1] if len(df_archivo.columns) > 1 else None)
+                col_prec = col_prec if col_prec is not None else (df_archivo.columns[2] if len(df_archivo.columns) > 2 else None)
+                col_sec = col_sec if col_sec is not None else (df_archivo.columns[3] if len(df_archivo.columns) > 3 else None)
 
-            df_base['Descripcion_Clean'] = df_base[col_desc].astype(str).str.strip()
-            df_base['Precio_Clean'] = df_base[col_prec].fillna(0)
-            df_base['cod_interno_clean'] = df_base[col_cod].apply(limpiar_codigo)
-            df_base['ean_clean'] = df_base[col_ean].apply(limpiar_codigo) if col_ean is not None else ""
-            
-            for fila_idx, fila in df_base.iterrows():
-                try:
-                    sec_val = str(fila[col_sec]).strip() if col_sec in fila and pd.notna(fila[col_sec]) else 'N/A'
-                    prod_info = {
+                if col_cod is None or col_desc is None or col_prec is None:
+                    diagnosticos.append(f"'{ruta}': no se pudieron identificar columnas de código/descripción/precio, se omite.")
+                else:
+                    sub = pd.DataFrame()
+                    sub['Descripcion_Clean'] = df_archivo[col_desc].astype(str).str.strip()
+                    sub['Precio_Clean'] = df_archivo[col_prec].fillna(0)
+                    sub['cod_interno_clean'] = df_archivo[col_cod].apply(limpiar_codigo)
+                    sub['ean_clean'] = df_archivo[col_ean].apply(limpiar_codigo) if col_ean is not None else ""
+                    sub['Sector_Clean'] = df_archivo[col_sec].astype(str).str.strip() if col_sec is not None else 'N/A'
+                    frames_productos.append(sub)
+            else:
+                # No tiene columna de precio: se asume maestro de códigos/EAN.
+                # Columna 0 = código interno; columnas 2 y 3 = códigos de barra/EAN asociados.
+                for fila_idx, fila in df_archivo.iterrows():
+                    if fila.dropna().empty: continue
+                    try:
+                        cod_interno_objetivo = limpiar_codigo(fila.iloc[0])
+                        if not cod_interno_objetivo: continue
+
+                        barras_c = fragmentar_codigos_multiples(fila.iloc[2]) if len(fila) > 2 else []
+                        barras_d = fragmentar_codigos_multiples(fila.iloc[3]) if len(fila) > 3 else []
+
+                        for cb in (barras_c + barras_d):
+                            if cb:
+                                mapa_puente_barras[cb] = cod_interno_objetivo
+                                lista_barras = mapa_interno_a_barras.setdefault(cod_interno_objetivo, [])
+                                if cb not in lista_barras:
+                                    lista_barras.append(cb)
+                    except Exception as e:
+                        diagnosticos.append(f"'{ruta}', fila {fila_idx + 2}: {e}")
+        except Exception as e:
+            diagnosticos.append(f"'{ruta}': {e}")
+
+    if frames_productos:
+        df_base = pd.concat(frames_productos, ignore_index=True)
+        for fila_idx, fila in df_base.iterrows():
+            try:
+                interno = fila['cod_interno_clean']
+                if interno:
+                    mapa_base[interno] = {
                         'desc': fila['Descripcion_Clean'],
                         'precio': fila['Precio_Clean'],
-                        'interno': fila['cod_interno_clean'],
+                        'interno': interno,
                         'ean': fila['ean_clean'],
-                        'sector': sec_val
+                        'sector': fila['Sector_Clean']
                     }
-                    if prod_info['interno']:
-                        mapa_base[prod_info['interno']] = prod_info
-                except Exception as e:
-                    diagnosticos.append(f"'{archivo_precios}', fila {fila_idx + 2}: {e}")
-        except Exception as e:
-            diagnosticos.append(f"No se pudo leer '{archivo_precios}': {e}")
+            except Exception as e:
+                diagnosticos.append(f"Error al indexar producto (fila {fila_idx + 2}): {e}")
 
     # 3. Padrón de Ofertas (Busca en carpeta ofertas/ o raíz)
     mapa_ofertas = {}
@@ -517,20 +526,23 @@ def cargar_todo(firma_archivos):
         else:
             mapa_ofertas[codigo] = nueva_of
 
-    archivo_ofertas = obtener_ultimo_archivo("ofertas", "padron de ofertas.xlsx")
-    if not archivo_ofertas and os.path.exists("padron de ofertas.xlsx"):
-        archivo_ofertas = "padron de ofertas.xlsx"
+    archivos_ofertas_candidatos = []
+    if os.path.isdir("ofertas"):
+        archivos_ofertas_candidatos = glob.glob(os.path.join("ofertas", "*.xlsx")) + glob.glob(os.path.join("ofertas", "*.xls"))
+    if os.path.exists("padron de ofertas.xlsx") and "padron de ofertas.xlsx" not in archivos_ofertas_candidatos:
+        archivos_ofertas_candidatos.append("padron de ofertas.xlsx")
 
-    if archivo_ofertas:
+    for ruta in archivos_ofertas_candidatos:
         try:
-            xls = pd.ExcelFile(archivo_ofertas)
-            
-            if "OFERTAS" in xls.sheet_names:
-                df_of = pd.read_excel(xls, sheet_name="OFERTAS")
+            xls = pd.ExcelFile(ruta)
+
+            hoja_ofertas = buscar_hoja(xls.sheet_names, "OFERTAS")
+            if hoja_ofertas:
+                df_of = pd.read_excel(xls, sheet_name=hoja_ofertas)
                 c0 = detectar_columna(df_of, ['interno'], 0)
                 c2 = detectar_columna(df_of, ['sku', 'barra'], 2)
-                c3 = detectar_columna(df_of, ['concepto', 'descrip'], 3)
-                c5 = detectar_columna(df_of, ['precio ofer', 'precio'], 5)
+                c3 = detectar_columna(df_of, ['concepto', 'detalle', 'tipo'], 3, excluir=['producto', 'articulo', 'artículo'])
+                c5 = detectar_columna(df_of, ['precio oferta', 'precio ofer', 'precio promo', 'precio'], 5, excluir=['individual', 'normal', 'unitario', 'lista'])
                 c6 = detectar_columna(df_of, ['ahorro', 'descuento'], 6)
                 c10 = detectar_columna(df_of, ['desde', 'inicio'], 10)
                 c11 = detectar_columna(df_of, ['hasta', 'fin', 'vencim'], 11)
@@ -551,14 +563,15 @@ def cargar_todo(firma_archivos):
                         agregar_oferta_con_prioridad(c_int, of_data)
                         agregar_oferta_con_prioridad(c_sku, of_data)
                     except Exception as e:
-                        diagnosticos.append(f"Hoja OFERTAS, fila {fila_idx + 2}: {e}")
+                        diagnosticos.append(f"'{ruta}', hoja OFERTAS, fila {fila_idx + 2}: {e}")
 
-            if "DESTACADOS" in xls.sheet_names:
-                df_dest = pd.read_excel(xls, sheet_name="DESTACADOS")
+            hoja_destacados = buscar_hoja(xls.sheet_names, "DESTACADOS")
+            if hoja_destacados:
+                df_dest = pd.read_excel(xls, sheet_name=hoja_destacados)
                 c0 = detectar_columna(df_dest, ['interno'], 0)
                 c2 = detectar_columna(df_dest, ['sku', 'barra'], 2)
-                c3 = detectar_columna(df_dest, ['concepto', 'descrip'], 3)
-                c4 = detectar_columna(df_dest, ['precio'], 4)
+                c3 = detectar_columna(df_dest, ['concepto', 'detalle', 'tipo'], 3, excluir=['producto', 'articulo', 'artículo'])
+                c4 = detectar_columna(df_dest, ['precio destacado', 'precio promo', 'precio'], 4, excluir=['individual', 'normal', 'unitario', 'lista'])
                 c6 = detectar_columna(df_dest, ['desde', 'inicio'], 6)
                 c7 = detectar_columna(df_dest, ['hasta', 'fin', 'vencim'], 7)
                 for fila_idx, fila in df_dest.iterrows():
@@ -578,14 +591,15 @@ def cargar_todo(firma_archivos):
                         agregar_oferta_con_prioridad(c_int, of_data)
                         agregar_oferta_con_prioridad(c_sku, of_data)
                     except Exception as e:
-                        diagnosticos.append(f"Hoja DESTACADOS, fila {fila_idx + 2}: {e}")
+                        diagnosticos.append(f"'{ruta}', hoja DESTACADOS, fila {fila_idx + 2}: {e}")
 
-            if "COMBOS" in xls.sheet_names:
-                df_comb = pd.read_excel(xls, sheet_name="COMBOS")
+            hoja_combos = buscar_hoja(xls.sheet_names, "COMBOS")
+            if hoja_combos:
+                df_comb = pd.read_excel(xls, sheet_name=hoja_combos)
                 c0 = detectar_columna(df_comb, ['interno'], 0)
                 c2 = detectar_columna(df_comb, ['sku', 'barra'], 2)
-                c3 = detectar_columna(df_comb, ['concepto', 'descrip'], 3)
-                c5 = detectar_columna(df_comb, ['precio'], 5)
+                c3 = detectar_columna(df_comb, ['concepto', 'detalle', 'tipo'], 3, excluir=['producto', 'articulo', 'artículo'])
+                c5 = detectar_columna(df_comb, ['precio combo', 'precio promo', 'precio'], 5, excluir=['individual', 'normal', 'unitario', 'lista'])
                 c6 = detectar_columna(df_comb, ['ahorro', 'descuento'], 6)
                 c7 = detectar_columna(df_comb, ['desde', 'inicio'], 7)
                 c8 = detectar_columna(df_comb, ['hasta', 'fin', 'vencim'], 8)
@@ -607,9 +621,12 @@ def cargar_todo(firma_archivos):
                         for sub_sku in lista_skus:
                             agregar_oferta_con_prioridad(sub_sku, of_data)
                     except Exception as e:
-                        diagnosticos.append(f"Hoja COMBOS, fila {fila_idx + 2}: {e}")
+                        diagnosticos.append(f"'{ruta}', hoja COMBOS, fila {fila_idx + 2}: {e}")
+
+            if not (hoja_ofertas or hoja_destacados or hoja_combos):
+                diagnosticos.append(f"'{ruta}': no se encontró ninguna hoja llamada OFERTAS, DESTACADOS o COMBOS.")
         except Exception as e:
-            diagnosticos.append(f"No se pudo leer '{archivo_ofertas}': {e}")
+            diagnosticos.append(f"No se pudo leer '{ruta}': {e}")
 
     return df_base, mapa_base, mapa_ofertas, mapa_puente_barras, mapa_interno_a_barras, diagnosticos
 
@@ -705,7 +722,7 @@ if df_base is not None:
                     'desc': fila['Descripcion_Clean'], 'precio': fila['Precio_Clean'],
                     'interno': fila['cod_interno_clean'],
                     'ean': fila['ean_clean'] if 'ean_clean' in fila and pd.notna(fila['ean_clean']) else '',
-                    'sector': str(fila['Descrip Sector']).strip() if 'Descrip Sector' in fila and pd.notna(fila['Descrip Sector']) else 'N/A'
+                    'sector': fila['Sector_Clean'] if 'Sector_Clean' in fila and pd.notna(fila['Sector_Clean']) else 'N/A'
                 })
 
         # --- MOSTRAR RESULTADOS ---
