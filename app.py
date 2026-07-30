@@ -356,13 +356,19 @@ def fragmentar_codigos_multiples(celda):
                 codigos_limpios.append(cod_p)
     return codigos_limpios
 
-def detectar_columna(df, alias_posibles, indice_fallback=None):
-    """Busca una columna por coincidencia parcial de nombre.
-    Si no encuentra ninguna, devuelve la columna en indice_fallback (comportamiento anterior) o None."""
-    for col in df.columns:
-        col_low = str(col).lower()
-        if any(alias in col_low for alias in alias_posibles):
-            return col
+def detectar_columna(df, alias_posibles, indice_fallback=None, excluir=None):
+    """Busca una columna probando los alias EN ORDEN DE PRIORIDAD: primero intenta encontrar
+    cualquier columna que contenga el alias más específico (alias_posibles[0]) en todo el
+    dataframe; solo si no hay ninguna coincidencia pasa al siguiente alias de la lista.
+    Esto evita que un alias genérico como 'precio' capture la primera columna de precio que
+    aparezca (p. ej. 'Precio Individual') en vez de la específica (p. ej. 'Precio Combo').
+    'excluir' es una lista de substrings que descartan una columna aunque matchee el alias."""
+    excluir = excluir or []
+    for alias in alias_posibles:
+        for col in df.columns:
+            col_low = str(col).lower()
+            if alias in col_low and not any(ex in col_low for ex in excluir):
+                return col
     if indice_fallback is not None and indice_fallback < len(df.columns):
         return df.columns[indice_fallback]
     return None
@@ -381,6 +387,7 @@ def cargar_todo(firma_archivos):
     # clave de caché, así Streamlit recalcula todo apenas cambia algún Excel en disco.
     df_base, mapa_base = None, {}
     mapa_puente_barras = {}
+    mapa_interno_a_barras = {}
     diagnosticos = []
 
     # 1. Maestro EAN
@@ -403,6 +410,9 @@ def cargar_todo(firma_archivos):
                     for cb in (barras_c + barras_d):
                         if cb:
                             mapa_puente_barras[cb] = cod_interno_objetivo
+                            lista_barras = mapa_interno_a_barras.setdefault(cod_interno_objetivo, [])
+                            if cb not in lista_barras:
+                                lista_barras.append(cb)
                 except Exception as e:
                     diagnosticos.append(f"Maestro EAN, fila {fila_idx + 2}: {e}")
         except Exception as e:
@@ -426,23 +436,38 @@ def cargar_todo(firma_archivos):
             
             df_base = pd.read_excel(archivo_precios, skiprows=header_idx) if header_idx > 0 else df_temp
             
-            # Mapeo flexible de columnas para Padrones de Artículos o productos.xlsx
-            col_map = {}
+            # Mapeo flexible de columnas para Padrones de Artículos o productos.xlsx.
+            # IMPORTANTE: se resuelve por PRIORIDAD (no se sobrescribe con la última coincidencia),
+            # y el código interno se distingue explícitamente del EAN/código de barras.
+            col_cod, col_ean, col_desc, col_prec, col_sec = None, None, None, None, None
+
+            # Prioridad 1: nombres explícitos
             for col in df_base.columns:
                 c_low = str(col).lower()
-                if 'codigo' in c_low or 'código' in c_low or 'interno' in c_low:
-                    col_map['cod_int'] = col
-                elif 'descrip' in c_low and 'sector' not in c_low and 'rubro' not in c_low:
-                    col_map['desc'] = col
-                elif 'precio' in c_low:
-                    col_map['precio'] = col
-                elif 'sector' in c_low or 'rubro' in c_low:
-                    col_map['sector'] = col
+                if col_cod is None and 'interno' in c_low:
+                    col_cod = col
+                if col_ean is None and ('ean' in c_low or 'barra' in c_low):
+                    col_ean = col
+                if col_desc is None and 'descrip' in c_low and 'sector' not in c_low and 'rubro' not in c_low:
+                    col_desc = col
+                if col_prec is None and 'precio' in c_low:
+                    col_prec = col
+                if col_sec is None and ('sector' in c_low or 'rubro' in c_low):
+                    col_sec = col
 
-            col_cod = col_map.get('cod_int', df_base.columns[0] if len(df_base.columns) > 0 else 'Codigo Interno')
-            col_desc = col_map.get('desc', df_base.columns[1] if len(df_base.columns) > 1 else 'Descripcion')
-            col_prec = col_map.get('precio', df_base.columns[2] if len(df_base.columns) > 2 else 'Precio')
-            col_sec = col_map.get('sector', df_base.columns[3] if len(df_base.columns) > 3 else 'Descrip Sector')
+            # Prioridad 2 (respaldo): "código" genérico, solo si no hay "interno" y excluyendo EAN/barra
+            if col_cod is None:
+                for col in df_base.columns:
+                    c_low = str(col).lower()
+                    if ('codigo' in c_low or 'código' in c_low) and 'ean' not in c_low and 'barra' not in c_low:
+                        col_cod = col
+                        break
+
+            # Fallback posicional si ninguna búsqueda por nombre funcionó
+            col_cod = col_cod if col_cod is not None else (df_base.columns[0] if len(df_base.columns) > 0 else 'Codigo Interno')
+            col_desc = col_desc if col_desc is not None else (df_base.columns[1] if len(df_base.columns) > 1 else 'Descripcion')
+            col_prec = col_prec if col_prec is not None else (df_base.columns[2] if len(df_base.columns) > 2 else 'Precio')
+            col_sec = col_sec if col_sec is not None else (df_base.columns[3] if len(df_base.columns) > 3 else 'Descrip Sector')
 
             if col_cod not in df_base.columns or col_desc not in df_base.columns or col_prec not in df_base.columns:
                 diagnosticos.append(
@@ -453,6 +478,7 @@ def cargar_todo(firma_archivos):
             df_base['Descripcion_Clean'] = df_base[col_desc].astype(str).str.strip()
             df_base['Precio_Clean'] = df_base[col_prec].fillna(0)
             df_base['cod_interno_clean'] = df_base[col_cod].apply(limpiar_codigo)
+            df_base['ean_clean'] = df_base[col_ean].apply(limpiar_codigo) if col_ean is not None else ""
             
             for fila_idx, fila in df_base.iterrows():
                 try:
@@ -461,6 +487,7 @@ def cargar_todo(firma_archivos):
                         'desc': fila['Descripcion_Clean'],
                         'precio': fila['Precio_Clean'],
                         'interno': fila['cod_interno_clean'],
+                        'ean': fila['ean_clean'],
                         'sector': sec_val
                     }
                     if prod_info['interno']:
@@ -584,10 +611,10 @@ def cargar_todo(firma_archivos):
         except Exception as e:
             diagnosticos.append(f"No se pudo leer '{archivo_ofertas}': {e}")
 
-    return df_base, mapa_base, mapa_ofertas, mapa_puente_barras, diagnosticos
+    return df_base, mapa_base, mapa_ofertas, mapa_puente_barras, mapa_interno_a_barras, diagnosticos
 
 firma_actual = obtener_firma_archivos()
-df_base, mapa_base, mapa_ofertas, mapa_puente_barras, diagnosticos_carga = cargar_todo(firma_actual)
+df_base, mapa_base, mapa_ofertas, mapa_puente_barras, mapa_interno_a_barras, diagnosticos_carga = cargar_todo(firma_actual)
 
 # --- PANEL DE DIAGNÓSTICO (solo aparece si hubo problemas al leer algún Excel) ---
 if diagnosticos_carga:
@@ -677,6 +704,7 @@ if df_base is not None:
                 resultados_lista.append({
                     'desc': fila['Descripcion_Clean'], 'precio': fila['Precio_Clean'],
                     'interno': fila['cod_interno_clean'],
+                    'ean': fila['ean_clean'] if 'ean_clean' in fila and pd.notna(fila['ean_clean']) else '',
                     'sector': str(fila['Descrip Sector']).strip() if 'Descrip Sector' in fila and pd.notna(fila['Descrip Sector']) else 'N/A'
                 })
 
@@ -696,6 +724,13 @@ if df_base is not None:
                 oferta_vinculada = mapa_ofertas.get(prod['interno'])
                 precio_base_visual = formatear_precio(prod['precio'])
                 cod_int = prod['interno'] if prod['interno'] != '' else 'N/A'
+
+                ean_directo = prod.get('ean', '')
+                if ean_directo:
+                    ean_visual = ean_directo
+                else:
+                    barras_relacionadas = mapa_interno_a_barras.get(prod['interno'], [])
+                    ean_visual = ", ".join(barras_relacionadas) if barras_relacionadas else "N/A"
                 
                 badge_tiempo = ""
                 es_oferta_valida = False
@@ -749,6 +784,7 @@ if df_base is not None:
                         f'</div>'
                         f'<div class="meta-flex">'
                         f'<div class="meta-item"><span class="meta-label">Código Interno</span><span class="meta-valor">{cod_int}</span></div>'
+                        f'<div class="meta-item"><span class="meta-label">EAN</span><span class="meta-valor">{ean_visual}</span></div>'
                         f'<div class="meta-item"><span class="meta-label">Sector</span><span class="meta-valor">{prod["sector"]}</span></div>'
                         f'</div>'
                         f'</div>'
@@ -760,6 +796,7 @@ if df_base is not None:
                         f'<div class="precio-contenedor"><p class="precio-enorme">{precio_base_visual}</p></div>'
                         f'<div class="meta-flex">'
                         f'<div class="meta-item"><span class="meta-label">Código Interno</span><span class="meta-valor">{cod_int}</span></div>'
+                        f'<div class="meta-item"><span class="meta-label">EAN</span><span class="meta-valor">{ean_visual}</span></div>'
                         f'<div class="meta-item"><span class="meta-label">Sector</span><span class="meta-valor">{prod["sector"]}</span></div>'
                         f'</div>'
                         f'</div>'
