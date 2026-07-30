@@ -13,6 +13,9 @@ st.set_page_config(
     layout="centered"
 )
 
+# --- CONSTANTES DE CONTROL ---
+MAX_RESULTADOS_VISIBLES = 25
+
 # --- INICIALIZACIÓN DE ESTADOS PERSISTENTES ---
 if 'historial' not in st.session_state:
     st.session_state.historial = []
@@ -246,13 +249,34 @@ def obtener_ultimo_archivo(carpeta, nombre_fallback=""):
         return nombre_fallback
     return None
 
+# --- FIRMA DE ARCHIVOS PARA INVALIDAR CACHÉ AUTOMÁTICAMENTE ---
+def obtener_firma_archivos():
+    """Devuelve una tupla (ruta, fecha_modificacion) por cada archivo relevante.
+    Cambia apenas se sube/reemplaza un Excel, forzando a Streamlit a recalcular."""
+    firma = []
+    for carpeta in ("precios", "ofertas"):
+        if os.path.isdir(carpeta):
+            for patron in ("*.xlsx", "*.xls"):
+                for f in glob.glob(os.path.join(carpeta, patron)):
+                    try:
+                        firma.append((f, os.path.getmtime(f)))
+                    except OSError:
+                        pass
+    for nombre in ("maestro ean.xlsx", "productos.xlsx", "padron de ofertas.xlsx"):
+        if os.path.exists(nombre):
+            try:
+                firma.append((nombre, os.path.getmtime(nombre)))
+            except OSError:
+                pass
+    return tuple(sorted(firma))
+
 # --- AUXILIARES Y FORMATEROS ---
 def formatear_precio(valor):
     try:
         if pd.isna(valor) or valor == '': return "N/A"
         entero = round(float(valor))
         return f"${entero:,.0f}".replace(",", ".")
-    except:
+    except (ValueError, TypeError):
         return f"${valor}"
 
 def formatear_fecha(val):
@@ -262,7 +286,7 @@ def formatear_fecha(val):
         if pd.notna(dt):
             return dt.strftime("%d/%m/%Y")
         return str(val).split(" ")[0]
-    except:
+    except (ValueError, TypeError):
         return str(val)
 
 def evaluar_estado_oferta(desde_val, hasta_val):
@@ -288,7 +312,7 @@ def evaluar_estado_oferta(desde_val, hasta_val):
             return f'<span class="status-tiempo status-activo">⏱️ Activa (Hace {diferencia} días)</span>'
         else:
             return f'<span class="status-tiempo status-futuro">⏳ Inicia en {abs(diferencia)} días</span>'
-    except:
+    except (ValueError, TypeError, AttributeError):
         return ""
 
 def limpiar_codigo(cod):
@@ -309,7 +333,7 @@ def limpiar_codigo(cod):
     if 'e+' in st_cod.lower():
         try:
             st_cod = f"{float(st_cod):.0f}"
-        except:
+        except (ValueError, TypeError):
             pass
             
     if '.' in st_cod and st_cod.split('.')[1] == '0':
@@ -332,12 +356,33 @@ def fragmentar_codigos_multiples(celda):
                 codigos_limpios.append(cod_p)
     return codigos_limpios
 
+def detectar_columna(df, alias_posibles, indice_fallback=None):
+    """Busca una columna por coincidencia parcial de nombre.
+    Si no encuentra ninguna, devuelve la columna en indice_fallback (comportamiento anterior) o None."""
+    for col in df.columns:
+        col_low = str(col).lower()
+        if any(alias in col_low for alias in alias_posibles):
+            return col
+    if indice_fallback is not None and indice_fallback < len(df.columns):
+        return df.columns[indice_fallback]
+    return None
+
+def valor_fila(fila, columna, default=None):
+    """Acceso seguro a un valor de fila por nombre de columna."""
+    if columna is None or columna not in fila:
+        return default
+    val = fila[columna]
+    return val if pd.notna(val) else default
+
 # --- CARGA DE DATOS INDEXADA (OPTIMIZADA Y DINÁMICA) ---
 @st.cache_data(show_spinner=False)
-def cargar_todo():
+def cargar_todo(firma_archivos):
+    # 'firma_archivos' no se usa dentro de la función: solo sirve como parte de la
+    # clave de caché, así Streamlit recalcula todo apenas cambia algún Excel en disco.
     df_base, mapa_base = None, {}
-    mapa_puente_barras = {} 
-    
+    mapa_puente_barras = {}
+    diagnosticos = []
+
     # 1. Maestro EAN
     archivo_ean = obtener_ultimo_archivo("precios", "maestro ean.xlsx")
     if not archivo_ean and os.path.exists("maestro ean.xlsx"):
@@ -346,19 +391,22 @@ def cargar_todo():
     if archivo_ean:
         try:
             df_maestro = pd.read_excel(archivo_ean)
-            for _, fila in df_maestro.iterrows():
+            for fila_idx, fila in df_maestro.iterrows():
                 if fila.dropna().empty: continue
-                cod_interno_objetivo = limpiar_codigo(fila.iloc[0]) 
-                if not cod_interno_objetivo: continue
-                
-                barras_c = fragmentar_codigos_multiples(fila.iloc[2]) if len(fila) > 2 else []
-                barras_d = fragmentar_codigos_multiples(fila.iloc[3]) if len(fila) > 3 else []
-                
-                for cb in (barras_c + barras_d):
-                    if cb:
-                        mapa_puente_barras[cb] = cod_interno_objetivo
-        except:
-            pass
+                try:
+                    cod_interno_objetivo = limpiar_codigo(fila.iloc[0])
+                    if not cod_interno_objetivo: continue
+
+                    barras_c = fragmentar_codigos_multiples(fila.iloc[2]) if len(fila) > 2 else []
+                    barras_d = fragmentar_codigos_multiples(fila.iloc[3]) if len(fila) > 3 else []
+
+                    for cb in (barras_c + barras_d):
+                        if cb:
+                            mapa_puente_barras[cb] = cod_interno_objetivo
+                except Exception as e:
+                    diagnosticos.append(f"Maestro EAN, fila {fila_idx + 2}: {e}")
+        except Exception as e:
+            diagnosticos.append(f"No se pudo leer '{archivo_ean}': {e}")
 
     # 2. Productos / Precios (Busca en carpeta precios/)
     archivo_precios = obtener_ultimo_archivo("precios", "productos.xlsx")
@@ -396,22 +444,31 @@ def cargar_todo():
             col_prec = col_map.get('precio', df_base.columns[2] if len(df_base.columns) > 2 else 'Precio')
             col_sec = col_map.get('sector', df_base.columns[3] if len(df_base.columns) > 3 else 'Descrip Sector')
 
+            if col_cod not in df_base.columns or col_desc not in df_base.columns or col_prec not in df_base.columns:
+                diagnosticos.append(
+                    f"'{archivo_precios}': no se detectaron con certeza las columnas de código/descripción/precio. "
+                    f"Se usan las primeras columnas disponibles como respaldo, revisá los encabezados."
+                )
+
             df_base['Descripcion_Clean'] = df_base[col_desc].astype(str).str.strip()
             df_base['Precio_Clean'] = df_base[col_prec].fillna(0)
             df_base['cod_interno_clean'] = df_base[col_cod].apply(limpiar_codigo)
             
-            for _, fila in df_base.iterrows():
-                sec_val = str(fila[col_sec]).strip() if col_sec in fila and pd.notna(fila[col_sec]) else 'N/A'
-                prod_info = {
-                    'desc': fila['Descripcion_Clean'], 
-                    'precio': fila['Precio_Clean'],
-                    'interno': fila['cod_interno_clean'],
-                    'sector': sec_val
-                }
-                if prod_info['interno']: 
-                    mapa_base[prod_info['interno']] = prod_info
-        except:
-            pass
+            for fila_idx, fila in df_base.iterrows():
+                try:
+                    sec_val = str(fila[col_sec]).strip() if col_sec in fila and pd.notna(fila[col_sec]) else 'N/A'
+                    prod_info = {
+                        'desc': fila['Descripcion_Clean'],
+                        'precio': fila['Precio_Clean'],
+                        'interno': fila['cod_interno_clean'],
+                        'sector': sec_val
+                    }
+                    if prod_info['interno']:
+                        mapa_base[prod_info['interno']] = prod_info
+                except Exception as e:
+                    diagnosticos.append(f"'{archivo_precios}', fila {fila_idx + 2}: {e}")
+        except Exception as e:
+            diagnosticos.append(f"No se pudo leer '{archivo_precios}': {e}")
 
     # 3. Padrón de Ofertas (Busca en carpeta ofertas/ o raíz)
     mapa_ofertas = {}
@@ -428,7 +485,7 @@ def cargar_todo():
                         mapa_ofertas[codigo] = nueva_of
                 elif pd.isna(dt_existente) and pd.notna(dt_nueva):
                     mapa_ofertas[codigo] = nueva_of
-            except:
+            except (ValueError, TypeError):
                 mapa_ofertas[codigo] = nueva_of
         else:
             mapa_ofertas[codigo] = nueva_of
@@ -443,64 +500,103 @@ def cargar_todo():
             
             if "OFERTAS" in xls.sheet_names:
                 df_of = pd.read_excel(xls, sheet_name="OFERTAS")
-                for _, fila in df_of.iterrows():
+                c0 = detectar_columna(df_of, ['interno'], 0)
+                c2 = detectar_columna(df_of, ['sku', 'barra'], 2)
+                c3 = detectar_columna(df_of, ['concepto', 'descrip'], 3)
+                c5 = detectar_columna(df_of, ['precio ofer', 'precio'], 5)
+                c6 = detectar_columna(df_of, ['ahorro', 'descuento'], 6)
+                c10 = detectar_columna(df_of, ['desde', 'inicio'], 10)
+                c11 = detectar_columna(df_of, ['hasta', 'fin', 'vencim'], 11)
+                for fila_idx, fila in df_of.iterrows():
                     if fila.dropna().empty: continue
-                    c_int = limpiar_codigo(fila.iloc[0])
-                    c_sku = limpiar_codigo(fila.iloc[2]) if len(fila) > 2 else ""
-                    
-                    of_data = {
-                        'tipo': 'OFERTA', 
-                        'precio_of': fila.iloc[5] if len(fila) > 5 else 0, 
-                        'ahorro': fila.iloc[6] if len(fila) > 6 else None, 
-                        'concepto': fila.iloc[3] if len(fila) > 3 else "OFERTA", 
-                        'desde': fila.iloc[10] if len(fila) > 10 else None, 
-                        'hasta': fila.iloc[11] if len(fila) > 11 else None
-                    }
-                    agregar_oferta_con_prioridad(c_int, of_data)
-                    agregar_oferta_con_prioridad(c_sku, of_data)
+                    try:
+                        c_int = limpiar_codigo(valor_fila(fila, c0, ''))
+                        c_sku = limpiar_codigo(valor_fila(fila, c2, ''))
+
+                        of_data = {
+                            'tipo': 'OFERTA',
+                            'precio_of': valor_fila(fila, c5, 0),
+                            'ahorro': valor_fila(fila, c6),
+                            'concepto': valor_fila(fila, c3, "OFERTA"),
+                            'desde': valor_fila(fila, c10),
+                            'hasta': valor_fila(fila, c11)
+                        }
+                        agregar_oferta_con_prioridad(c_int, of_data)
+                        agregar_oferta_con_prioridad(c_sku, of_data)
+                    except Exception as e:
+                        diagnosticos.append(f"Hoja OFERTAS, fila {fila_idx + 2}: {e}")
 
             if "DESTACADOS" in xls.sheet_names:
                 df_dest = pd.read_excel(xls, sheet_name="DESTACADOS")
-                for _, fila in df_dest.iterrows():
+                c0 = detectar_columna(df_dest, ['interno'], 0)
+                c2 = detectar_columna(df_dest, ['sku', 'barra'], 2)
+                c3 = detectar_columna(df_dest, ['concepto', 'descrip'], 3)
+                c4 = detectar_columna(df_dest, ['precio'], 4)
+                c6 = detectar_columna(df_dest, ['desde', 'inicio'], 6)
+                c7 = detectar_columna(df_dest, ['hasta', 'fin', 'vencim'], 7)
+                for fila_idx, fila in df_dest.iterrows():
                     if fila.dropna().empty: continue
-                    c_int = limpiar_codigo(fila.iloc[0])
-                    c_sku = limpiar_codigo(fila.iloc[2]) if len(fila) > 2 else ""
-                    
-                    of_data = {
-                        'tipo': 'DESTACADO', 
-                        'precio_of': fila.iloc[4] if len(fila) > 4 else 0, 
-                        'ahorro': None, 
-                        'concepto': fila.iloc[3] if len(fila) > 3 else "DESTACADO", 
-                        'desde': fila.iloc[6] if len(fila) > 6 else None, 
-                        'hasta': fila.iloc[7] if len(fila) > 7 else None
-                    }
-                    agregar_oferta_con_prioridad(c_int, of_data)
-                    agregar_oferta_con_prioridad(c_sku, of_data)
+                    try:
+                        c_int = limpiar_codigo(valor_fila(fila, c0, ''))
+                        c_sku = limpiar_codigo(valor_fila(fila, c2, ''))
+
+                        of_data = {
+                            'tipo': 'DESTACADO',
+                            'precio_of': valor_fila(fila, c4, 0),
+                            'ahorro': None,
+                            'concepto': valor_fila(fila, c3, "DESTACADO"),
+                            'desde': valor_fila(fila, c6),
+                            'hasta': valor_fila(fila, c7)
+                        }
+                        agregar_oferta_con_prioridad(c_int, of_data)
+                        agregar_oferta_con_prioridad(c_sku, of_data)
+                    except Exception as e:
+                        diagnosticos.append(f"Hoja DESTACADOS, fila {fila_idx + 2}: {e}")
 
             if "COMBOS" in xls.sheet_names:
                 df_comb = pd.read_excel(xls, sheet_name="COMBOS")
-                for _, fila in df_comb.iterrows():
+                c0 = detectar_columna(df_comb, ['interno'], 0)
+                c2 = detectar_columna(df_comb, ['sku', 'barra'], 2)
+                c3 = detectar_columna(df_comb, ['concepto', 'descrip'], 3)
+                c5 = detectar_columna(df_comb, ['precio'], 5)
+                c6 = detectar_columna(df_comb, ['ahorro', 'descuento'], 6)
+                c7 = detectar_columna(df_comb, ['desde', 'inicio'], 7)
+                c8 = detectar_columna(df_comb, ['hasta', 'fin', 'vencim'], 8)
+                for fila_idx, fila in df_comb.iterrows():
                     if fila.dropna().empty: continue
-                    lista_internos = fragmentar_codigos_multiples(fila.iloc[0])
-                    lista_skus = fragmentar_codigos_multiples(fila.iloc[2]) if len(fila) > 2 else []
-                    of_data = {
-                        'tipo': 'COMBO', 
-                        'precio_of': fila.iloc[5] if len(fila) > 5 else 0, 
-                        'ahorro': fila.iloc[6] if len(fila) > 6 else None, 
-                        'concepto': fila.iloc[3] if len(fila) > 3 else "COMBO", 
-                        'desde': fila.iloc[7] if len(fila) > 7 else None, 
-                        'hasta': fila.iloc[8] if len(fila) > 8 else None
-                    }
-                    for sub_int in lista_internos:
-                        agregar_oferta_con_prioridad(sub_int, of_data)
-                    for sub_sku in lista_skus:
-                        agregar_oferta_con_prioridad(sub_sku, of_data)
-        except:
-            pass
+                    try:
+                        lista_internos = fragmentar_codigos_multiples(valor_fila(fila, c0))
+                        lista_skus = fragmentar_codigos_multiples(valor_fila(fila, c2))
+                        of_data = {
+                            'tipo': 'COMBO',
+                            'precio_of': valor_fila(fila, c5, 0),
+                            'ahorro': valor_fila(fila, c6),
+                            'concepto': valor_fila(fila, c3, "COMBO"),
+                            'desde': valor_fila(fila, c7),
+                            'hasta': valor_fila(fila, c8)
+                        }
+                        for sub_int in lista_internos:
+                            agregar_oferta_con_prioridad(sub_int, of_data)
+                        for sub_sku in lista_skus:
+                            agregar_oferta_con_prioridad(sub_sku, of_data)
+                    except Exception as e:
+                        diagnosticos.append(f"Hoja COMBOS, fila {fila_idx + 2}: {e}")
+        except Exception as e:
+            diagnosticos.append(f"No se pudo leer '{archivo_ofertas}': {e}")
 
-    return df_base, mapa_base, mapa_ofertas, mapa_puente_barras
+    return df_base, mapa_base, mapa_ofertas, mapa_puente_barras, diagnosticos
 
-df_base, mapa_base, mapa_ofertas, mapa_puente_barras = cargar_todo()
+firma_actual = obtener_firma_archivos()
+df_base, mapa_base, mapa_ofertas, mapa_puente_barras, diagnosticos_carga = cargar_todo(firma_actual)
+
+# --- PANEL DE DIAGNÓSTICO (solo aparece si hubo problemas al leer algún Excel) ---
+if diagnosticos_carga:
+    with st.expander(f"⚠️ Avisos al cargar los datos ({len(diagnosticos_carga)})", expanded=False):
+        st.caption("Estas filas o archivos tuvieron problemas y se omitieron. El resto de la app funciona con normalidad.")
+        for d in diagnosticos_carga[:50]:
+            st.caption(f"• {d}")
+        if len(diagnosticos_carga) > 50:
+            st.caption(f"... y {len(diagnosticos_carga) - 50} avisos más.")
 
 # --- FUNCIONES DE CONTROL DEL HISTORIAL ---
 def agregar_a_comparacion(producto, promo):
@@ -587,6 +683,15 @@ if df_base is not None:
         # --- MOSTRAR RESULTADOS ---
         if resultados_lista:
             st.write("---")
+
+            total_encontrados = len(resultados_lista)
+            if total_encontrados > MAX_RESULTADOS_VISIBLES:
+                st.info(
+                    f"🔎 Se encontraron {total_encontrados} resultados. Mostrando los primeros "
+                    f"{MAX_RESULTADOS_VISIBLES}: afiná tu búsqueda para ver menos coincidencias."
+                )
+                resultados_lista = resultados_lista[:MAX_RESULTADOS_VISIBLES]
+
             for idx, prod in enumerate(resultados_lista):
                 oferta_vinculada = mapa_ofertas.get(prod['interno'])
                 precio_base_visual = formatear_precio(prod['precio'])
