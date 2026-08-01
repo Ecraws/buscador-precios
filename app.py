@@ -5,11 +5,12 @@ from datetime import datetime
 import re
 import os
 import glob
+import unicodedata
 
 # Configuración de página optimizada para rendimiento y diseño móvil
 st.set_page_config(
-    page_title="ECRAWS PRICE", 
-    page_icon="⚡", 
+    page_title="Depot Consultas", 
+    page_icon="🛒", 
     layout="centered"
 )
 
@@ -30,7 +31,7 @@ st.markdown("""
         max-width: 100% !important;
         padding: 14px !important;
         overflow-x: hidden !important;
-        background-color: #0b0f19 !important; /* Fondo Dark Neo-Premium */
+        background-color: #081C33 !important; /* Azul marino Depot */
     }
     
     h1, h2, h3, h4, p, label {
@@ -48,8 +49,8 @@ st.markdown("""
         font-size: 16px !important;
     }
     .stTextInput input:focus {
-        border-color: #00f2fe !important;
-        box-shadow: 0 0 10px rgba(0, 242, 254, 0.2) !important;
+        border-color: #FF8135 !important;
+        box-shadow: 0 0 10px rgba(255, 129, 53, 0.25) !important;
     }
 
     div[data-testid="stForm"] {
@@ -62,8 +63,8 @@ st.markdown("""
     }
     
     .stButton button {
-        background: linear-gradient(135deg, #2ecc71 0%, #00f2fe 100%) !important;
-        color: #0b0f19 !important;
+        background: linear-gradient(135deg, #FF8135 0%, #FFB35C 100%) !important;
+        color: #081C33 !important;
         font-weight: 700 !important;
         border-radius: 14px !important;
         border: none !important;
@@ -116,11 +117,11 @@ st.markdown("""
         left: 0;
         width: 100%;
         height: 4px;
-        background: linear-gradient(90deg, #64748b, #cbd5e1);
+        background: linear-gradient(90deg, #0B3B6B, #4A85BD);
     }
 
     .producto-card.con-oferta::before {
-        background: linear-gradient(90deg, #ff4757, #ffa502) !important;
+        background: linear-gradient(90deg, #ff4757, #FF8135) !important;
     }
     
     .producto-titulo {
@@ -156,8 +157,8 @@ st.markdown("""
     }
     
     .split-half.combo-side {
-        background: rgba(255, 165, 0, 0.04);
-        border: 1px solid rgba(254, 165, 2, 0.2) !important;
+        background: rgba(255, 129, 53, 0.05);
+        border: 1px solid rgba(255, 129, 53, 0.25) !important;
     }
 
     /* --- EL PRECIO ES EL REY --- */
@@ -171,7 +172,7 @@ st.markdown("""
     }
 
     .precio-oferta-color {
-        background: linear-gradient(90deg, #ff4757 0%, #ffa502 100%);
+        background: linear-gradient(90deg, #ff4757 0%, #FF8135 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
@@ -238,7 +239,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Título de la App
-st.markdown('<h1 style="text-align: center; font-size: 28px; font-weight: 800; background: linear-gradient(90deg, #ffffff, #94a3b8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 20px;">⚡ ECRAWS PRICE</h1>', unsafe_allow_html=True)
+st.markdown(
+    '<div style="text-align:center; margin-bottom:20px;">'
+    '<span style="font-size:30px; font-weight:800; color:#ffffff;">Depot<span style="color:#FF8135;">.</span> Consultas</span>'
+    '<span style="font-size:13px; font-style:italic; color:#FF8135; margin-left:8px;">by ecraws</span>'
+    '</div>',
+    unsafe_allow_html=True
+)
 
 # --- FIRMA DE ARCHIVOS PARA INVALIDAR CACHÉ AUTOMÁTICAMENTE ---
 def obtener_firma_archivos():
@@ -349,19 +356,54 @@ def fragmentar_codigos_multiples(celda):
                 codigos_limpios.append(cod_p)
     return codigos_limpios
 
-def detectar_columna(df, alias_posibles, indice_fallback=None, excluir=None):
-    """Busca una columna probando los alias EN ORDEN DE PRIORIDAD: primero intenta encontrar
-    cualquier columna que contenga el alias más específico (alias_posibles[0]) en todo el
-    dataframe; solo si no hay ninguna coincidencia pasa al siguiente alias de la lista.
-    Esto evita que un alias genérico como 'precio' capture la primera columna de precio que
-    aparezca (p. ej. 'Precio Individual') en vez de la específica (p. ej. 'Precio Combo').
-    'excluir' es una lista de substrings que descartan una columna aunque matchee el alias."""
+# --- DICCIONARIO DE ENCABEZADOS REALES (según referencia provista por el usuario) ---
+# Cada campo lógico que la app necesita puede tener varios nombres de columna según la hoja
+# (OFERTAS/DESTACADO usan "COD_INT", "PRECIO", "OFERTA"; BODEGA LIQUID/PDP usan "Código Interno",
+# "PVP CU", "Oferta CU"; COMBOS agrega sufijos numéricos como "OFERTA7"). Para agregar soporte a
+# una hoja nueva en el futuro, alcanza con sumar el nombre de columna que use a la lista del
+# campo correspondiente acá abajo — no hace falta tocar el resto del código.
+ALIAS_CAMPOS = {
+    'interno':       ['cod_int', 'codigo interno', 'interno'],
+    'sku':           ['sku', 'codigo de barras', 'codigo ean', 'ean', 'barra'],
+    'descripcion':   ['descripcion_articulos', 'articulo', 'descripcion'],
+    'precio_normal': ['pvp cu', 'precio'],
+    'precio_oferta': ['oferta cu', 'oferta'],
+    'ahorro':        ['ahorro cu', 'ahorro'],
+    'concepto':      ['concepto'],
+    'desde':         ['desde'],
+    'hasta':         ['hasta'],
+    'sector':        ['sector', 'rubro'],
+}
+
+def _normalizar_encabezado(texto):
+    """Pasa a minúsculas, saca acentos y quita sufijos numéricos finales
+    (ej: 'SKU4' -> 'sku', 'OFERTA7' -> 'oferta', 'Código Interno' -> 'codigo interno')."""
+    texto = str(texto).strip().lower()
+    texto = ''.join(c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c))
+    texto = re.sub(r'\d+$', '', texto).strip()
+    return texto
+
+def detectar_columna_por_campo(df, campo, indice_fallback=None, excluir=None):
+    """Busca la columna que corresponde a un campo lógico (ej: 'precio_oferta') usando el
+    diccionario ALIAS_CAMPOS. Primero intenta una coincidencia EXACTA de encabezado normalizado
+    (evita que 'precio' matchee 'Precio Individual' cuando existe una columna 'Oferta' separada);
+    si ninguna columna coincide exactamente, prueba una coincidencia parcial como respaldo."""
     excluir = excluir or []
+    alias_posibles = ALIAS_CAMPOS.get(campo, [campo])
+    normalizados = {_normalizar_encabezado(c): c for c in df.columns}
+
+    for alias in alias_posibles:
+        if alias in normalizados:
+            col = normalizados[alias]
+            if not any(ex in _normalizar_encabezado(col) for ex in excluir):
+                return col
+
     for alias in alias_posibles:
         for col in df.columns:
-            col_low = str(col).lower()
-            if alias in col_low and not any(ex in col_low for ex in excluir):
+            col_norm = _normalizar_encabezado(col)
+            if alias in col_norm and not any(ex in col_norm for ex in excluir):
                 return col
+
     if indice_fallback is not None and indice_fallback < len(df.columns):
         return df.columns[indice_fallback]
     return None
@@ -374,6 +416,7 @@ def buscar_hoja(nombres_disponibles, objetivo):
         if str(nombre).strip().lower() == objetivo_low:
             return nombre
     return None
+
 
 def valor_fila(fila, columna, default=None):
     """Acceso seguro a un valor de fila por nombre de columna."""
@@ -425,37 +468,17 @@ def cargar_todo(firma_archivos):
                     break
             df_archivo = pd.read_excel(ruta, skiprows=header_idx) if header_idx > 0 else df_temp
 
-            columnas_low = [str(c).lower() for c in df_archivo.columns]
-            parece_productos = any('precio' in c for c in columnas_low)
+            columnas_low = [_normalizar_encabezado(c) for c in df_archivo.columns]
+            parece_productos = any(
+                alias in col_norm for col_norm in columnas_low for alias in ALIAS_CAMPOS['precio_normal']
+            )
 
             if parece_productos:
-                # Mapeo flexible de columnas. Se resuelve por PRIORIDAD (no se sobrescribe
-                # con la última coincidencia), y el código interno se distingue del EAN/barras.
-                col_cod, col_ean, col_desc, col_prec, col_sec = None, None, None, None, None
-                for col in df_archivo.columns:
-                    c_low = str(col).lower()
-                    if col_cod is None and 'interno' in c_low:
-                        col_cod = col
-                    if col_ean is None and ('ean' in c_low or 'barra' in c_low):
-                        col_ean = col
-                    if col_desc is None and 'descrip' in c_low and 'sector' not in c_low and 'rubro' not in c_low:
-                        col_desc = col
-                    if col_prec is None and 'precio' in c_low:
-                        col_prec = col
-                    if col_sec is None and ('sector' in c_low or 'rubro' in c_low):
-                        col_sec = col
-
-                if col_cod is None:
-                    for col in df_archivo.columns:
-                        c_low = str(col).lower()
-                        if ('codigo' in c_low or 'código' in c_low) and 'ean' not in c_low and 'barra' not in c_low:
-                            col_cod = col
-                            break
-
-                col_cod = col_cod if col_cod is not None else (df_archivo.columns[0] if len(df_archivo.columns) > 0 else None)
-                col_desc = col_desc if col_desc is not None else (df_archivo.columns[1] if len(df_archivo.columns) > 1 else None)
-                col_prec = col_prec if col_prec is not None else (df_archivo.columns[2] if len(df_archivo.columns) > 2 else None)
-                col_sec = col_sec if col_sec is not None else (df_archivo.columns[3] if len(df_archivo.columns) > 3 else None)
+                col_cod = detectar_columna_por_campo(df_archivo, 'interno', 0, excluir=['ean', 'barra'])
+                col_ean = detectar_columna_por_campo(df_archivo, 'sku')
+                col_desc = detectar_columna_por_campo(df_archivo, 'descripcion', 1, excluir=['sector', 'rubro'])
+                col_prec = detectar_columna_por_campo(df_archivo, 'precio_normal', 2)
+                col_sec = detectar_columna_por_campo(df_archivo, 'sector', 3)
 
                 if col_cod is None or col_desc is None or col_prec is None:
                     diagnosticos.append(f"'{ruta}': no se pudieron identificar columnas de código/descripción/precio, se omite.")
@@ -526,6 +549,59 @@ def cargar_todo(firma_archivos):
         else:
             mapa_ofertas[codigo] = nueva_of
 
+    def _procesar_hoja_de_ofertas(df_hoja, tipo_etiqueta, nombre_hoja, ruta, permite_multiples_codigos=False):
+        """Extrae ofertas de una hoja usando el diccionario ALIAS_CAMPOS. Sirve para cualquier
+        hoja con esta forma (OFERTAS, DESTACADO, BODEGA LIQUID, PDP, COMBOS)."""
+        c_int = detectar_columna_por_campo(df_hoja, 'interno', 0)
+        c_sku = detectar_columna_por_campo(df_hoja, 'sku', 2)
+        c_concepto = detectar_columna_por_campo(df_hoja, 'concepto', excluir=['producto', 'articulo'])
+        c_precio_of = detectar_columna_por_campo(df_hoja, 'precio_oferta', excluir=['normal', 'individual', 'unitario', 'lista'])
+        if c_precio_of is None:
+            # Hojas de un solo precio (ej. DESTACADO) no tienen columna "oferta" separada:
+            # esa única columna de precio ES el precio a mostrar.
+            c_precio_of = detectar_columna_por_campo(df_hoja, 'precio_normal')
+        c_ahorro = detectar_columna_por_campo(df_hoja, 'ahorro')
+        c_desde = detectar_columna_por_campo(df_hoja, 'desde')
+        c_hasta = detectar_columna_por_campo(df_hoja, 'hasta')
+
+        if c_precio_of is None:
+            diagnosticos.append(f"'{ruta}', hoja {nombre_hoja}: no se encontró una columna de precio de oferta reconocible, se omite la hoja.")
+            return
+
+        for fila_idx, fila in df_hoja.iterrows():
+            if fila.dropna().empty: continue
+            try:
+                of_data = {
+                    'tipo': tipo_etiqueta,
+                    'precio_of': valor_fila(fila, c_precio_of, 0),
+                    'ahorro': valor_fila(fila, c_ahorro),
+                    'concepto': valor_fila(fila, c_concepto, tipo_etiqueta),
+                    'desde': valor_fila(fila, c_desde),
+                    'hasta': valor_fila(fila, c_hasta)
+                }
+                if permite_multiples_codigos:
+                    for cod in fragmentar_codigos_multiples(valor_fila(fila, c_int)):
+                        agregar_oferta_con_prioridad(cod, of_data)
+                    for cod in fragmentar_codigos_multiples(valor_fila(fila, c_sku)):
+                        agregar_oferta_con_prioridad(cod, of_data)
+                else:
+                    agregar_oferta_con_prioridad(limpiar_codigo(valor_fila(fila, c_int, '')), of_data)
+                    agregar_oferta_con_prioridad(limpiar_codigo(valor_fila(fila, c_sku, '')), of_data)
+            except Exception as e:
+                diagnosticos.append(f"'{ruta}', hoja {nombre_hoja}, fila {fila_idx + 2}: {e}")
+
+    # Hojas reconocidas: (nombre de la hoja en el Excel, etiqueta a mostrar en la tarjeta,
+    # permite varios códigos por celda). Para sumar una hoja nueva en el futuro, agregá una
+    # tupla acá — no hace falta tocar nada más.
+    HOJAS_RECONOCIDAS = [
+        ("OFERTAS", "OFERTA", False),
+        ("DESTACADO", "DESTACADO", False),
+        ("DESTACADOS", "DESTACADO", False),
+        ("BODEGA LIQUID", "LIQUIDACIÓN", False),
+        ("PDP", "PDP", False),
+        ("COMBOS", "COMBO", True),
+    ]
+
     archivos_ofertas_candidatos = []
     if os.path.isdir("ofertas"):
         archivos_ofertas_candidatos = glob.glob(os.path.join("ofertas", "*.xlsx")) + glob.glob(os.path.join("ofertas", "*.xls"))
@@ -535,96 +611,18 @@ def cargar_todo(firma_archivos):
     for ruta in archivos_ofertas_candidatos:
         try:
             xls = pd.ExcelFile(ruta)
+            hojas_ya_procesadas = set()
 
-            hoja_ofertas = buscar_hoja(xls.sheet_names, "OFERTAS")
-            if hoja_ofertas:
-                df_of = pd.read_excel(xls, sheet_name=hoja_ofertas)
-                c0 = detectar_columna(df_of, ['interno'], 0)
-                c2 = detectar_columna(df_of, ['sku', 'barra'], 2)
-                c3 = detectar_columna(df_of, ['concepto', 'detalle', 'tipo'], 3, excluir=['producto', 'articulo', 'artículo'])
-                c5 = detectar_columna(df_of, ['precio oferta', 'precio ofer', 'precio promo', 'precio'], 5, excluir=['individual', 'normal', 'unitario', 'lista'])
-                c6 = detectar_columna(df_of, ['ahorro', 'descuento'], 6)
-                c10 = detectar_columna(df_of, ['desde', 'inicio'], 10)
-                c11 = detectar_columna(df_of, ['hasta', 'fin', 'vencim'], 11)
-                for fila_idx, fila in df_of.iterrows():
-                    if fila.dropna().empty: continue
-                    try:
-                        c_int = limpiar_codigo(valor_fila(fila, c0, ''))
-                        c_sku = limpiar_codigo(valor_fila(fila, c2, ''))
+            for nombre_objetivo, tipo_etiqueta, multi_codigo in HOJAS_RECONOCIDAS:
+                hoja_real = buscar_hoja(xls.sheet_names, nombre_objetivo)
+                if hoja_real and hoja_real not in hojas_ya_procesadas:
+                    df_hoja = pd.read_excel(xls, sheet_name=hoja_real)
+                    _procesar_hoja_de_ofertas(df_hoja, tipo_etiqueta, hoja_real, ruta, permite_multiples_codigos=multi_codigo)
+                    hojas_ya_procesadas.add(hoja_real)
 
-                        of_data = {
-                            'tipo': 'OFERTA',
-                            'precio_of': valor_fila(fila, c5, 0),
-                            'ahorro': valor_fila(fila, c6),
-                            'concepto': valor_fila(fila, c3, "OFERTA"),
-                            'desde': valor_fila(fila, c10),
-                            'hasta': valor_fila(fila, c11)
-                        }
-                        agregar_oferta_con_prioridad(c_int, of_data)
-                        agregar_oferta_con_prioridad(c_sku, of_data)
-                    except Exception as e:
-                        diagnosticos.append(f"'{ruta}', hoja OFERTAS, fila {fila_idx + 2}: {e}")
-
-            hoja_destacados = buscar_hoja(xls.sheet_names, "DESTACADOS")
-            if hoja_destacados:
-                df_dest = pd.read_excel(xls, sheet_name=hoja_destacados)
-                c0 = detectar_columna(df_dest, ['interno'], 0)
-                c2 = detectar_columna(df_dest, ['sku', 'barra'], 2)
-                c3 = detectar_columna(df_dest, ['concepto', 'detalle', 'tipo'], 3, excluir=['producto', 'articulo', 'artículo'])
-                c4 = detectar_columna(df_dest, ['precio destacado', 'precio promo', 'precio'], 4, excluir=['individual', 'normal', 'unitario', 'lista'])
-                c6 = detectar_columna(df_dest, ['desde', 'inicio'], 6)
-                c7 = detectar_columna(df_dest, ['hasta', 'fin', 'vencim'], 7)
-                for fila_idx, fila in df_dest.iterrows():
-                    if fila.dropna().empty: continue
-                    try:
-                        c_int = limpiar_codigo(valor_fila(fila, c0, ''))
-                        c_sku = limpiar_codigo(valor_fila(fila, c2, ''))
-
-                        of_data = {
-                            'tipo': 'DESTACADO',
-                            'precio_of': valor_fila(fila, c4, 0),
-                            'ahorro': None,
-                            'concepto': valor_fila(fila, c3, "DESTACADO"),
-                            'desde': valor_fila(fila, c6),
-                            'hasta': valor_fila(fila, c7)
-                        }
-                        agregar_oferta_con_prioridad(c_int, of_data)
-                        agregar_oferta_con_prioridad(c_sku, of_data)
-                    except Exception as e:
-                        diagnosticos.append(f"'{ruta}', hoja DESTACADOS, fila {fila_idx + 2}: {e}")
-
-            hoja_combos = buscar_hoja(xls.sheet_names, "COMBOS")
-            if hoja_combos:
-                df_comb = pd.read_excel(xls, sheet_name=hoja_combos)
-                c0 = detectar_columna(df_comb, ['interno'], 0)
-                c2 = detectar_columna(df_comb, ['sku', 'barra'], 2)
-                c3 = detectar_columna(df_comb, ['concepto', 'detalle', 'tipo'], 3, excluir=['producto', 'articulo', 'artículo'])
-                c5 = detectar_columna(df_comb, ['precio combo', 'precio promo', 'precio'], 5, excluir=['individual', 'normal', 'unitario', 'lista'])
-                c6 = detectar_columna(df_comb, ['ahorro', 'descuento'], 6)
-                c7 = detectar_columna(df_comb, ['desde', 'inicio'], 7)
-                c8 = detectar_columna(df_comb, ['hasta', 'fin', 'vencim'], 8)
-                for fila_idx, fila in df_comb.iterrows():
-                    if fila.dropna().empty: continue
-                    try:
-                        lista_internos = fragmentar_codigos_multiples(valor_fila(fila, c0))
-                        lista_skus = fragmentar_codigos_multiples(valor_fila(fila, c2))
-                        of_data = {
-                            'tipo': 'COMBO',
-                            'precio_of': valor_fila(fila, c5, 0),
-                            'ahorro': valor_fila(fila, c6),
-                            'concepto': valor_fila(fila, c3, "COMBO"),
-                            'desde': valor_fila(fila, c7),
-                            'hasta': valor_fila(fila, c8)
-                        }
-                        for sub_int in lista_internos:
-                            agregar_oferta_con_prioridad(sub_int, of_data)
-                        for sub_sku in lista_skus:
-                            agregar_oferta_con_prioridad(sub_sku, of_data)
-                    except Exception as e:
-                        diagnosticos.append(f"'{ruta}', hoja COMBOS, fila {fila_idx + 2}: {e}")
-
-            if not (hoja_ofertas or hoja_destacados or hoja_combos):
-                diagnosticos.append(f"'{ruta}': no se encontró ninguna hoja llamada OFERTAS, DESTACADOS o COMBOS.")
+            if not hojas_ya_procesadas:
+                nombres_reconocidos = ", ".join(sorted(set(n for n, _, _ in HOJAS_RECONOCIDAS)))
+                diagnosticos.append(f"'{ruta}': no se encontró ninguna hoja reconocida (se esperaba alguna de: {nombres_reconocidos}).")
         except Exception as e:
             diagnosticos.append(f"No se pudo leer '{ruta}': {e}")
 
@@ -667,7 +665,7 @@ if st.session_state.historial:
             
             if promo_info:
                 precio_final = formatear_precio(promo_info['precio_of'])
-                badge_promo = f"🔥 <span style='color: #ffa502; font-weight: bold;'>{promo_info['tipo']}</span>"
+                badge_promo = f"🔥 <span style='color: #FF8135; font-weight: bold;'>{promo_info['tipo']}</span>"
             else:
                 precio_final = precio_base
                 badge_promo = "🏷️ <span style='color: #94a3b8;'>Normal</span>"
@@ -774,7 +772,7 @@ if df_base is not None:
                             f'<div class="precio-enorme" style="color:#94a3b8;">{precio_base_visual}</div>'
                             f'</div>'
                             f'<div class="split-half combo-side">'
-                            f'<div class="split-label" style="color:#ffa502;">Precio Combo</div>'
+                            f'<div class="split-label" style="color:#FF8135;">Precio Combo</div>'
                             f'<div class="precio-enorme precio-oferta-color">{precio_oferta_visual}</div>'
                             f'</div>'
                             f'</div>'
@@ -790,7 +788,7 @@ if df_base is not None:
                     html_tarjeta = (
                         f'<div class="producto-card con-oferta">'
                         f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:6px;">'
-                        f'<span style="padding:4px 10px; background:linear-gradient(135deg, #ff4757, #ffa502); color:white; font-weight:700; font-size:11px; border-radius:8px; text-transform:uppercase; letter-spacing:0.5px;">🔥 {tipo_promo}</span>'
+                        f'<span style="padding:4px 10px; background:linear-gradient(135deg, #ff4757, #FF8135); color:white; font-weight:700; font-size:11px; border-radius:8px; text-transform:uppercase; letter-spacing:0.5px;">🔥 {tipo_promo}</span>'
                         f'{badge_tiempo}'
                         f'</div>'
                         f'<h2 class="producto-titulo">{prod["desc"]}</h2>'
