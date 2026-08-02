@@ -30,6 +30,7 @@ st.markdown("""
     .main, .block-container {
         max-width: 100% !important;
         padding: 14px !important;
+        padding-top: 4rem !important;
         overflow-x: hidden !important;
         background-color: #081C33 !important; /* Azul marino Depot */
     }
@@ -698,10 +699,10 @@ if st.session_state.historial:
 # --- INTERFAZ DE BÚSQUEDA ---
 if df_base is not None:
     with st.form(key="formulario_busqueda", clear_on_submit=False):
-        busqueda_input = st.text_input("🔍 Buscar Producto:", placeholder="Código o nombre...", value=st.session_state.busqueda_activa)
+        st.text_input("🔍 Buscar Producto:", placeholder="Código o nombre...", key="campo_busqueda")
         bot_buscar = st.form_submit_button("CONSEGUIR PRECIO")
         if bot_buscar:
-            st.session_state.busqueda_activa = busqueda_input
+            st.session_state.busqueda_activa = st.session_state.campo_busqueda
 
     # Procesar resultados
     if st.session_state.busqueda_activa:
